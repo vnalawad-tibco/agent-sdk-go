@@ -51,9 +51,10 @@ func main() {
 
 	// Create MCP server config with the custom transport
 	mcpServerCfg := sdkmcp.LazyMCPServerConfig{
-		Name:               "CustomTransportMCPServer",
-		Type:               "custom",
-		CustomMCPTransport: t2,
+		Name:                "CustomTransportMCPServer",
+		Type:                "custom",
+		CustomTransportType: "inmemory",
+		CustomMCPTransport:  t2,
 	}
 
 	mcpServer, err := sdkmcp.GetOrCreateServerFromCache(ctx, mcpServerCfg)
