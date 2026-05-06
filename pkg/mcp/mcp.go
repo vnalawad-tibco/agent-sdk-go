@@ -828,21 +828,10 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 	// Create the command transport using the official SDK
 	transport := &mcp.CommandTransport{Command: cmd}
 
-	// Create a new client with basic implementation info
-	client := mcp.NewClient(&mcp.Implementation{
-		Name:    "agent-sdk-go",
-		Version: "0.0.0",
-	}, nil)
-
-	// Add tracing middleware to the client
-	client.AddSendingMiddleware(tracingMiddleware)
-	// Connect to the server using the transport
-	session, err := client.Connect(ctx, transport, nil)
-	if err != nil {
-		mcpErr := ClassifyError(err, "Connect", "stdio-server", "stdio")
-		// govulncheck:ignore GO-2025-4155 - err.Error() used for logging only, not exploitable
+	server, mcpErr := newServerFromTransport(ctx, transport, "stdio-server", "stdio", nil, logger)
+	if mcpErr != nil {
 		logger.Error(ctx, "[STDIO SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
-			"error":      err.Error(),
+			"error":      mcpErr.Error(),
 			"error_type": mcpErr.ErrorType,
 			"retryable":  mcpErr.Retryable,
 			"command":    config.Command,
@@ -851,58 +840,6 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 		})
 		return nil, mcpErr
 	}
-
-	// Log successful connection
-	logger.Info(ctx, "[STDIO SERVER] Successfully connected to MCP server", map[string]interface{}{
-		"command": config.Command,
-		"stderr":  stderrBuf.String(), // May contain startup logs
-	})
-
-	// Get initialization result immediately after connection
-	initResult := session.InitializeResult()
-
-	var serverInfo *interfaces.MCPServerInfo
-	var capabilities *interfaces.MCPServerCapabilities
-
-	if initResult != nil {
-		// Extract server info (standard MCP fields)
-		if initResult.ServerInfo != nil {
-			serverInfo = &interfaces.MCPServerInfo{
-				Name:    initResult.ServerInfo.Name,    // Always present
-				Title:   initResult.ServerInfo.Title,   // Optional
-				Version: initResult.ServerInfo.Version, // Optional
-			}
-
-			logger.Info(ctx, "Discovered MCP server metadata", map[string]interface{}{
-				"server_name":    serverInfo.Name,
-				"server_title":   serverInfo.Title,
-				"server_version": serverInfo.Version,
-			})
-		}
-
-		// Extract capabilities
-		if initResult.Capabilities != nil {
-			capabilities = convertMCPCapabilities(initResult.Capabilities)
-		}
-	}
-
-	logger.Debug(ctx, "MCP server connection established with metadata", map[string]interface{}{
-		"has_server_info":  serverInfo != nil,
-		"has_capabilities": capabilities != nil,
-	})
-
-	server := &MCPServerImpl{
-		session:      session,
-		logger:       logger,
-		serverInfo:   serverInfo,
-		capabilities: capabilities,
-	}
-
-	// Wrap with retry logic if configured
-	if retryConfig != nil {
-		return NewRetryableServer(server, retryConfig), nil
-	}
-
 	return server, nil
 }
 
@@ -917,9 +854,11 @@ type HTTPServerConfig struct {
 	ResourceIndicator string `json:"resource_indicator,omitempty"`
 }
 
+// CustomTransportServerConfig holds configuration for a custom transport MCP server
 type CustomTransportServerConfig struct {
-	Transport mcp.Transport
-	Logger    logging.Logger
+	Transport     mcp.Transport
+	Logger        logging.Logger
+	TransportType string // e.g. "websocket", "pulsar", "kafka"
 }
 
 // ServerProtocolType defines the protocol type for the MCP server communication
@@ -966,15 +905,6 @@ func NewHTTPServerWithRetry(ctx context.Context, config HTTPServerConfig, retryC
 		logger = logging.New()
 	}
 
-	// Create a new client with basic implementation info
-	client := mcp.NewClient(&mcp.Implementation{
-		Name:    "agent-sdk-go",
-		Version: "0.0.0",
-	}, nil)
-
-	// Add tracing middleware to the client
-	client.AddSendingMiddleware(tracingMiddleware)
-
 	httpClient := http.DefaultClient
 
 	// Handle token-based authentication
@@ -1007,10 +937,58 @@ func NewHTTPServerWithRetry(ctx context.Context, config HTTPServerConfig, retryC
 		}
 	}
 
-	// Connect to the server using the transport
+	server, err := newServerFromTransport(ctx, transport, "http-server", "http", retryConfig, logger)
+	if err != nil {
+		logger.Error(ctx, "[HTTP SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
+			"error":      err.Error(),
+			"error_type": err.ErrorType,
+			"retryable":  err.Retryable,
+		})
+		return nil, err
+	}
+	return server, nil
+}
+
+func NewCustomTransportServer(ctx context.Context, config CustomTransportServerConfig) (interfaces.MCPServer, error) {
+	return NewCustomTransportServerWithRetry(ctx, config, nil)
+}
+
+func NewCustomTransportServerWithRetry(ctx context.Context, config CustomTransportServerConfig, retryConfig *RetryConfig) (interfaces.MCPServer, error) {
+	// Create logger if not configured
+	logger := config.Logger
+	if logger == nil {
+		logger = logging.New()
+	}
+	serverName := strings.ToLower(config.TransportType) + "-server"
+	server, err := newServerFromTransport(ctx, config.Transport, serverName, config.TransportType, retryConfig, logger)
+	if err != nil {
+		logger.Error(ctx, "[SERVER ERROR] Failed to connect to MCP server - ", map[string]interface{}{
+			"error":          err.Error(),
+			"error_type":     err.ErrorType,
+			"retryable":      err.Retryable,
+			"transport_type": config.TransportType,
+			"server_name":    serverName,
+		})
+		return nil, err
+	}
+	return server, nil
+}
+
+func newServerFromTransport(ctx context.Context, transport mcp.Transport, serverName, serverType string, retryConfig *RetryConfig, logger logging.Logger) (interfaces.MCPServer, *MCPError) {
+
+	// Create a new client with basic implementation info
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    "agent-sdk-go",
+		Version: "0.0.0",
+	}, nil)
+
+	// Add tracing middleware to the client
+	client.AddSendingMiddleware(tracingMiddleware)
+
+	// Connect to the server using the provided transport
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
-		mcpErr := ClassifyError(err, "Connect", "http-server", "http")
+		mcpErr := ClassifyError(err, "Connect", serverName, serverType)
 		return nil, mcpErr
 	}
 
@@ -1042,83 +1020,7 @@ func NewHTTPServerWithRetry(ctx context.Context, config HTTPServerConfig, retryC
 		}
 	}
 
-	logger.Debug(ctx, "HTTP MCP server connection established with metadata", map[string]interface{}{
-		"base_url":         config.BaseURL,
-		"has_server_info":  serverInfo != nil,
-		"has_capabilities": capabilities != nil,
-	})
-
-	server := &MCPServerImpl{
-		session:      session,
-		logger:       logger,
-		serverInfo:   serverInfo,
-		capabilities: capabilities,
-	}
-
-	// Wrap with retry logic if configured
-	if retryConfig != nil {
-		return NewRetryableServer(server, retryConfig), nil
-	}
-
-	return server, nil
-}
-
-func NewCustomTransportServer(ctx context.Context, config CustomTransportServerConfig) (interfaces.MCPServer, error) {
-	return NewCustomTransportServerWithRetry(ctx, config, nil)
-}
-
-func NewCustomTransportServerWithRetry(ctx context.Context, config CustomTransportServerConfig, retryConfig *RetryConfig) (interfaces.MCPServer, error) {
-	// Create logger if not configured
-	logger := config.Logger
-	if logger == nil {
-		logger = logging.New()
-	}
-
-	// Create a new client with basic implementation info
-	client := mcp.NewClient(&mcp.Implementation{
-		Name:    "agent-sdk-go",
-		Version: "0.0.0",
-	}, nil)
-
-	// Add tracing middleware to the client
-	client.AddSendingMiddleware(tracingMiddleware)
-
-	// Connect to the server using the provided custom transport
-	session, err := client.Connect(ctx, config.Transport, nil)
-	if err != nil {
-		mcpErr := ClassifyError(err, "Connect", "custom-transport-server", "custom-transport")
-		return nil, mcpErr
-	}
-
-	// Get initialization result immediately after connection
-	initResult := session.InitializeResult()
-
-	var serverInfo *interfaces.MCPServerInfo
-	var capabilities *interfaces.MCPServerCapabilities
-
-	if initResult != nil {
-		// Extract server		info (standard MCP fields)
-		if initResult.ServerInfo != nil {
-			serverInfo = &interfaces.MCPServerInfo{
-				Name:    initResult.ServerInfo.Name,    // Always present
-				Title:   initResult.ServerInfo.Title,   // Optional
-				Version: initResult.ServerInfo.Version, // Optional
-			}
-
-			logger.Info(ctx, "Discovered MCP server metadata", map[string]interface{}{
-				"server_name":    serverInfo.Name,
-				"server_title":   serverInfo.Title,
-				"server_version": serverInfo.Version,
-			})
-		}
-
-		// Extract capabilities
-		if initResult.Capabilities != nil {
-			capabilities = convertMCPCapabilities(initResult.Capabilities)
-		}
-	}
-
-	logger.Debug(ctx, "Custom transport MCP server connection established with metadata", map[string]interface{}{
+	logger.Debug(ctx, "MCP server connection established with metadata - ", map[string]interface{}{
 		"has_server_info":  serverInfo != nil,
 		"has_capabilities": capabilities != nil,
 	})
