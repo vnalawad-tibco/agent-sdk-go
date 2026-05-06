@@ -10,7 +10,7 @@ import (
 // NewResponseFormat creates a ResponseFormat from a struct type
 func NewResponseFormat(v interface{}) *interfaces.ResponseFormat {
 	t := reflect.TypeOf(v)
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 
@@ -32,13 +32,19 @@ func getJSONSchema(t reflect.Type) map[string]any {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonTag == "-" {
+			// Field is explicitly excluded from JSON; skip it so it
+			// doesn't surface in the generated schema as a "-" property
+			// (#300).
+			continue
+		}
 		if jsonTag == "" {
 			jsonTag = field.Name
 		}
 
 		fieldType := field.Type
 		// Handle pointer types by getting the underlying element type
-		if fieldType.Kind() == reflect.Ptr {
+		if fieldType.Kind() == reflect.Pointer {
 			fieldType = fieldType.Elem()
 		}
 
@@ -60,7 +66,7 @@ func getJSONSchema(t reflect.Type) map[string]any {
 			// Handle arrays/slices with items property
 			itemType := fieldType.Elem()
 			// Handle pointer element types in slices
-			if itemType.Kind() == reflect.Ptr {
+			if itemType.Kind() == reflect.Pointer {
 				itemType = itemType.Elem()
 			}
 
@@ -106,7 +112,7 @@ func getJSONSchema(t reflect.Type) map[string]any {
 
 func getJSONType(t reflect.Type) string {
 	// Handle pointer types
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		return getJSONType(t.Elem())
 	}
 
@@ -138,6 +144,10 @@ func getRequiredFields(t reflect.Type) []string {
 		field := t.Field(i)
 		if !strings.Contains(field.Tag.Get("json"), "omitempty") {
 			jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+			if jsonTag == "-" {
+				// Excluded from JSON entirely; must not be required.
+				continue
+			}
 			if jsonTag == "" {
 				jsonTag = field.Name
 			}

@@ -942,7 +942,10 @@ func (a *Agent) runLocalWithTracking(ctx context.Context, input string) (string,
 		return response, nil
 	}
 
-	// Use pre-initialized tools (manual + MCP tools already combined during agent creation)
+	// Use pre-initialized tools (manual + MCP tools already combined during agent creation).
+	// initializeMCPTools already populated a.tools, so re-collecting here can append duplicates;
+	// always run the merged slice through deduplicateTools to defend against that and against
+	// MCP servers re-listing tools they already exposed at startup.
 	allTools := a.tools
 
 	if len(a.mcpServers) > 0 {
@@ -951,13 +954,13 @@ func (a *Agent) runLocalWithTracking(ctx context.Context, input string) (string,
 			// Log warning but continue - MCP tools are optional
 			a.logger.Warn(context.Background(), fmt.Sprintf("Failed to collect MCP tools: %v", err), nil)
 		} else if len(mcpTools) > 0 {
-			allTools = append(allTools, mcpTools...)
+			allTools = deduplicateTools(append(allTools, mcpTools...))
 		}
 	}
 
 	if len(a.lazyMCPConfigs) > 0 {
 		lazyMCPTools := a.createLazyMCPTools()
-		allTools = append(allTools, lazyMCPTools...)
+		allTools = deduplicateTools(append(allTools, lazyMCPTools...))
 	}
 
 	if (len(allTools) > 0) && a.requirePlanApproval {
@@ -1274,21 +1277,19 @@ func (a *Agent) runWithoutExecutionPlanWithToolsTracked(ctx context.Context, inp
 	tracker := getUsageTracker(ctx)
 
 	if len(tools) > 0 {
-		if tracker != nil {
-			for _, tool := range tools {
-				tracker.addToolCall(tool.Name())
-			}
-		}
+		// Record tool invocations as the LLM actually calls them, not the
+		// full set of available tools (#305).
+		toolsForLLM := wrapToolsWithTracker(tools, tracker)
 
 		if tracker != nil && tracker.detailed {
-			llmResp, err := a.llm.GenerateWithToolsDetailed(ctx, prompt, tools, generateOptions...)
+			llmResp, err := a.llm.GenerateWithToolsDetailed(ctx, prompt, toolsForLLM, generateOptions...)
 			if err != nil {
 				return "", fmt.Errorf("failed to generate response: %w", err)
 			}
 			response = llmResp.Content
 			tracker.addLLMUsage(llmResp.Usage, llmResp.Model)
 		} else {
-			response, err = a.llm.GenerateWithTools(ctx, prompt, tools, generateOptions...)
+			response, err = a.llm.GenerateWithTools(ctx, prompt, toolsForLLM, generateOptions...)
 			if err != nil {
 				return "", fmt.Errorf("failed to generate response: %w", err)
 			}

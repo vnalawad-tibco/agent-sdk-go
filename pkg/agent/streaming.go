@@ -13,6 +13,21 @@ import (
 	"github.com/Ingenimax/agent-sdk-go/pkg/tracing"
 )
 
+// sendEvent pushes an AgentStreamEvent onto eventChan while respecting
+// caller cancellation. Every blocking send on eventChan in this file goes
+// through this helper so that abandoning the returned channel (timeout,
+// client disconnect, etc.) doesn't leak the producing goroutine waiting
+// on an unread channel (#291). Returns true on success, false if ctx was
+// cancelled before the event could be delivered.
+func sendEvent(ctx context.Context, eventChan chan<- interfaces.AgentStreamEvent, event interfaces.AgentStreamEvent) bool {
+	select {
+	case eventChan <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // RunStream executes the agent with streaming response
 func (a *Agent) RunStream(ctx context.Context, input string) (<-chan interfaces.AgentStreamEvent, error) {
 	// If custom stream function is set, use it instead
@@ -130,11 +145,11 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 				Role:    "user",
 				Content: input,
 			}); err != nil {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventError,
 					Error:     fmt.Errorf("failed to add user message to memory: %w", err),
 					Timestamp: time.Now(),
-				}
+				})
 				return
 			}
 		}
@@ -144,11 +159,11 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 		if a.guardrails != nil {
 			guardedInput, err := a.guardrails.ProcessInput(ctx, input)
 			if err != nil {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventError,
 					Error:     fmt.Errorf("guardrails error: %w", err),
 					Timestamp: time.Now(),
-				}
+				})
 				return
 			}
 			processedInput = guardedInput
@@ -160,17 +175,17 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 			// For now, plan actions are not streamed - fall back to regular handling
 			result, err := a.handlePlanAction(ctx, taskID, action, planInput)
 			if err != nil {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventError,
 					Error:     err,
 					Timestamp: time.Now(),
-				}
+				})
 			} else {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventContent,
 					Content:   result,
 					Timestamp: time.Now(),
-				}
+				})
 			}
 			return
 		}
@@ -185,28 +200,31 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 					Role:    "assistant",
 					Content: response,
 				}); err != nil {
-					eventChan <- interfaces.AgentStreamEvent{
+					sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 						Type:      interfaces.AgentEventError,
 						Error:     fmt.Errorf("failed to add role response to memory: %w", err),
 						Timestamp: time.Now(),
-					}
+					})
 					return
 				}
 			}
 
-			eventChan <- interfaces.AgentStreamEvent{
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 				Type:      interfaces.AgentEventContent,
 				Content:   response,
 				Timestamp: time.Now(),
-			}
-			eventChan <- interfaces.AgentStreamEvent{
+			})
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 				Type:      interfaces.AgentEventComplete,
 				Timestamp: time.Now(),
-			}
+			})
 			return
 		}
 
-		// Collect all tools
+		// Collect all tools. initializeMCPTools already populated a.tools, so the
+		// runtime re-collect below can re-add the same tools; deduplicate after the
+		// append to keep tool names unique (LLM providers like Anthropic reject
+		// requests with duplicate tool names — see issue #308).
 		allTools := a.tools
 
 		// Add MCP tools if available
@@ -217,7 +235,7 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 				// Warning: Failed to collect MCP tools
 				fmt.Printf("Warning: Failed to collect MCP tools: %v\n", err)
 			} else if len(mcpTools) > 0 {
-				allTools = append(allTools, mcpTools...)
+				allTools = deduplicateTools(append(allTools, mcpTools...))
 			}
 		}
 
@@ -226,21 +244,21 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 			// For now, fall back to non-streaming execution plan generation
 			result, err := a.runWithExecutionPlan(ctx, processedInput)
 			if err != nil {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventError,
 					Error:     err,
 					Timestamp: time.Now(),
-				}
+				})
 			} else {
-				eventChan <- interfaces.AgentStreamEvent{
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventContent,
 					Content:   result,
 					Timestamp: time.Now(),
-				}
-				eventChan <- interfaces.AgentStreamEvent{
+				})
+				sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 					Type:      interfaces.AgentEventComplete,
 					Timestamp: time.Now(),
-				}
+				})
 			}
 			return
 		}
@@ -249,11 +267,11 @@ func (a *Agent) runLocalStream(ctx context.Context, input string) (<-chan interf
 		length, err := a.runStreamingGeneration(ctx, processedInput, allTools, streamingLLM, eventChan)
 		responseLength = length
 		if err != nil {
-			eventChan <- interfaces.AgentStreamEvent{
+			sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 				Type:      interfaces.AgentEventError,
 				Error:     err,
 				Timestamp: time.Now(),
-			}
+			})
 		}
 	}()
 
@@ -334,7 +352,10 @@ func (a *Agent) runStreamingGeneration(
 	var err error
 
 	if len(allTools) > 0 {
-		llmEventChan, err = streamingLLM.GenerateWithToolsStream(ctxWithForwarder, input, allTools, options...)
+		// Record tool invocations as the LLM actually calls them, not the
+		// full set of available tools (#305).
+		toolsForLLM := wrapToolsWithTracker(allTools, getUsageTracker(ctx))
+		llmEventChan, err = streamingLLM.GenerateWithToolsStream(ctxWithForwarder, input, toolsForLLM, options...)
 	} else {
 		llmEventChan, err = streamingLLM.GenerateStream(ctxWithForwarder, input, options...)
 	}
@@ -376,7 +397,9 @@ func (a *Agent) runStreamingGeneration(
 		}
 
 		// Send agent event
-		eventChan <- agentEvent
+		if !sendEvent(ctx, eventChan, agentEvent) {
+			return int64(accumulatedContent.Len()), finalError
+		}
 	}
 
 	// Add messages to memory if available (save even on error to preserve conversation history)
@@ -422,14 +445,14 @@ func (a *Agent) runStreamingGeneration(
 	}
 
 	// Send completion event
-	eventChan <- interfaces.AgentStreamEvent{
+	sendEvent(ctx, eventChan, interfaces.AgentStreamEvent{
 		Type:      interfaces.AgentEventComplete,
 		Timestamp: time.Now(),
 		Metadata: map[string]interface{}{
 			"total_content_length": accumulatedContent.Len(),
 			"had_error":            finalError != nil,
 		},
-	}
+	})
 
 	return int64(accumulatedContent.Len()), finalError
 }
