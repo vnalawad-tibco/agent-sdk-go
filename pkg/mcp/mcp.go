@@ -721,11 +721,6 @@ func NewStdioServer(ctx context.Context, config StdioServerConfig) (interfaces.M
 
 // NewStdioServerWithRetry creates a new MCPServer with retry logic
 func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retryConfig *RetryConfig) (interfaces.MCPServer, error) {
-	// Create logger if not configured
-	logger := config.Logger
-	if logger == nil {
-		logger = logging.New()
-	}
 	// Validate the command and arguments to mitigate command injection risks
 	if config.Command == "" {
 		return nil, fmt.Errorf("command cannot be empty")
@@ -751,7 +746,7 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 	}
 
 	// Log the MCP server configuration before starting
-	logger.Debug(ctx, "Creating MCP server command", map[string]interface{}{
+	config.Logger.Debug(ctx, "Creating MCP server command", map[string]interface{}{
 		"command":      commandPath,
 		"args":         config.Args,
 		"env_provided": len(config.Env),
@@ -759,7 +754,7 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 
 	// Log each environment variable being provided to the MCP server
 	if len(config.Env) > 0 {
-		logger.Debug(ctx, "MCP server environment variables (from config)", map[string]interface{}{
+		config.Logger.Debug(ctx, "MCP server environment variables (from config)", map[string]interface{}{
 			"count": len(config.Env),
 		})
 		for i, envVar := range config.Env {
@@ -780,12 +775,12 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 						value = "***MASKED***"
 					}
 				}
-				logger.Debug(ctx, fmt.Sprintf("MCP env[%d]", i), map[string]interface{}{
+				config.Logger.Debug(ctx, fmt.Sprintf("MCP env[%d]", i), map[string]interface{}{
 					"key":   key,
 					"value": value,
 				})
 			} else {
-				logger.Debug(ctx, fmt.Sprintf("MCP env[%d]", i), map[string]interface{}{
+				config.Logger.Debug(ctx, fmt.Sprintf("MCP env[%d]", i), map[string]interface{}{
 					"raw": envVar,
 				})
 			}
@@ -799,7 +794,7 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 		cmd.Env = append(os.Environ(), config.Env...)
 
 		// Log the full command being executed for debugging
-		logger.Info(ctx, "[STDIO SERVER] Creating subprocess with command", map[string]interface{}{
+		config.Logger.Info(ctx, "[STDIO SERVER] Creating subprocess with command", map[string]interface{}{
 			"command":   commandPath,
 			"args":      config.Args,
 			"env_count": len(config.Env),
@@ -808,11 +803,11 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 		// Log environment variables (sanitized)
 		for i, envVar := range config.Env {
 			if len(envVar) > 60 {
-				logger.Debug(ctx, fmt.Sprintf("[STDIO SERVER ENV %d]", i), map[string]interface{}{
+				config.Logger.Debug(ctx, fmt.Sprintf("[STDIO SERVER ENV %d]", i), map[string]interface{}{
 					"env": envVar[:60] + "...",
 				})
 			} else {
-				logger.Debug(ctx, fmt.Sprintf("[STDIO SERVER ENV %d]", i), map[string]interface{}{
+				config.Logger.Debug(ctx, fmt.Sprintf("[STDIO SERVER ENV %d]", i), map[string]interface{}{
 					"env": envVar,
 				})
 			}
@@ -828,9 +823,9 @@ func NewStdioServerWithRetry(ctx context.Context, config StdioServerConfig, retr
 	// Create the command transport using the official SDK
 	transport := &mcp.CommandTransport{Command: cmd}
 
-	server, mcpErr := newServerFromTransport(ctx, transport, "stdio-server", "stdio", nil, logger)
+	server, mcpErr := newServerFromTransport(ctx, transport, "stdio-server", "stdio", nil, config.Logger)
 	if mcpErr != nil {
-		logger.Error(ctx, "[STDIO SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
+		config.Logger.Error(ctx, "[STDIO SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
 			"error":      mcpErr.Error(),
 			"error_type": mcpErr.ErrorType,
 			"retryable":  mcpErr.Retryable,
@@ -899,11 +894,6 @@ func NewHTTPServer(ctx context.Context, config HTTPServerConfig) (interfaces.MCP
 
 // NewHTTPServerWithRetry creates a new HTTP MCPServer with retry logic
 func NewHTTPServerWithRetry(ctx context.Context, config HTTPServerConfig, retryConfig *RetryConfig) (interfaces.MCPServer, error) {
-	// Create logger if not configured
-	logger := config.Logger
-	if logger == nil {
-		logger = logging.New()
-	}
 
 	httpClient := http.DefaultClient
 
@@ -930,16 +920,16 @@ func NewHTTPServerWithRetry(ctx context.Context, config HTTPServerConfig, retryC
 		}
 	default:
 		// Default to SSE if type is not recognized
-		logger.Warn(ctx, "Server protocol type is not set, defaulting to SSE", map[string]interface{}{})
+		config.Logger.Warn(ctx, "Server protocol type is not set, defaulting to SSE", map[string]interface{}{})
 		transport = &mcp.SSEClientTransport{
 			Endpoint:   config.BaseURL,
 			HTTPClient: httpClient,
 		}
 	}
 
-	server, err := newServerFromTransport(ctx, transport, "http-server", "http", retryConfig, logger)
+	server, err := newServerFromTransport(ctx, transport, "http-server", "http", retryConfig, config.Logger)
 	if err != nil {
-		logger.Error(ctx, "[HTTP SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
+		config.Logger.Error(ctx, "[HTTP SERVER ERROR] Failed to connect to MCP server", map[string]interface{}{
 			"error":      err.Error(),
 			"error_type": err.ErrorType,
 			"retryable":  err.Retryable,
@@ -954,15 +944,10 @@ func NewCustomTransportServer(ctx context.Context, config CustomTransportServerC
 }
 
 func NewCustomTransportServerWithRetry(ctx context.Context, config CustomTransportServerConfig, retryConfig *RetryConfig) (interfaces.MCPServer, error) {
-	// Create logger if not configured
-	logger := config.Logger
-	if logger == nil {
-		logger = logging.New()
-	}
 	serverName := strings.ToLower(config.TransportType) + "-server"
-	server, err := newServerFromTransport(ctx, config.Transport, serverName, config.TransportType, retryConfig, logger)
+	server, err := newServerFromTransport(ctx, config.Transport, serverName, config.TransportType, retryConfig, config.Logger)
 	if err != nil {
-		logger.Error(ctx, "[SERVER ERROR] Failed to connect to MCP server - ", map[string]interface{}{
+		config.Logger.Error(ctx, "[SERVER ERROR] Failed to connect to MCP server - ", map[string]interface{}{
 			"error":          err.Error(),
 			"error_type":     err.ErrorType,
 			"retryable":      err.Retryable,

@@ -56,6 +56,11 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 		return server, nil
 	}
 
+	serverLogger := config.Logger
+	if serverLogger == nil {
+		serverLogger = logging.New()
+	}
+
 	// Log environment variables being passed (masking sensitive values)
 	envDebug := make(map[string]string)
 	for _, envVar := range config.Env {
@@ -92,14 +97,14 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 			Command: config.Command,
 			Args:    config.Args,
 			Env:     config.Env,
-			Logger:  config.Logger,
+			Logger:  serverLogger,
 		})
 	case "http":
 		server, err = NewHTTPServer(ctx, HTTPServerConfig{
 			BaseURL:      config.URL,
 			Token:        config.Token,
 			ProtocolType: ServerProtocolType(config.HttpTransportMode),
-			Logger:       config.Logger,
+			Logger:       serverLogger,
 		})
 	case "custom":
 		if config.CustomMCPTransport == nil {
@@ -107,7 +112,7 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 		}
 		server, err = NewCustomTransportServer(ctx, CustomTransportServerConfig{
 			Transport:     config.CustomMCPTransport,
-			Logger:        config.Logger,
+			Logger:        serverLogger,
 			TransportType: config.CustomTransportType,
 		})
 	default:
