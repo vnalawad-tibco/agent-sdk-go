@@ -37,7 +37,7 @@ var globalServerCache = &LazyMCPServerCache{
 
 // getOrCreateServer gets an existing server or creates a new one
 func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config LazyMCPServerConfig) (interfaces.MCPServer, error) {
-	serverKey := fmt.Sprintf("%s:%s:%v", config.Type, config.Name, config.Command)
+	serverKey := fmt.Sprintf("%s:%s:%v:%s", config.Type, config.Name, config.Command, config.CustomTransportType)
 
 	// Try to get existing server (read lock)
 	cache.mu.RLock()
@@ -61,38 +61,37 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 		serverLogger = logging.New()
 	}
 
-	// Log environment variables being passed (masking sensitive values)
-	envDebug := make(map[string]string)
-	for _, envVar := range config.Env {
-		parts := strings.SplitN(envVar, "=", 2)
-		if len(parts) == 2 {
-			key := parts[0]
-			value := parts[1]
-			// Mask sensitive values (show first 10 chars for debugging)
-			if len(value) > 10 {
-				envDebug[key] = value[:10] + "..."
-			} else if value == "" {
-				envDebug[key] = "<EMPTY>"
-			} else {
-				envDebug[key] = value
-			}
-		}
-	}
-
-	cache.logger.Info(ctx, "Initializing MCP server on demand", map[string]interface{}{
-		"server_name": config.Name,
-		"server_type": config.Type,
-		"command":     config.Command,
-		"args":        config.Args,
-		"env_count":   len(config.Env),
-		"env_vars":    envDebug,
-	})
-
 	var server interfaces.MCPServer
 	var err error
 
 	switch config.Type {
 	case "stdio":
+		// Log environment variables being passed (masking sensitive values)
+		envDebug := make(map[string]string)
+		for _, envVar := range config.Env {
+			parts := strings.SplitN(envVar, "=", 2)
+			if len(parts) == 2 {
+				key := parts[0]
+				value := parts[1]
+				// Mask sensitive values (show first 10 chars for debugging)
+				if len(value) > 10 {
+					envDebug[key] = value[:10] + "..."
+				} else if value == "" {
+					envDebug[key] = "<EMPTY>"
+				} else {
+					envDebug[key] = value
+				}
+			}
+		}
+
+		cache.logger.Info(ctx, "Initializing MCP server on demand", map[string]interface{}{
+			"server_name": config.Name,
+			"server_type": config.Type,
+			"command":     config.Command,
+			"args":        config.Args,
+			"env_count":   len(config.Env),
+			"env_vars":    envDebug,
+		})
 		server, err = NewStdioServer(ctx, StdioServerConfig{
 			Command: config.Command,
 			Args:    config.Args,
@@ -100,6 +99,11 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 			Logger:  serverLogger,
 		})
 	case "http":
+		cache.logger.Info(ctx, "Initializing MCP server on demand", map[string]interface{}{
+			"server_name":    config.Name,
+			"server_type":    config.Type,
+			"transport_mode": config.HttpTransportMode,
+		})
 		server, err = NewHTTPServer(ctx, HTTPServerConfig{
 			BaseURL:      config.URL,
 			Token:        config.Token,
@@ -110,6 +114,11 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 		if config.CustomMCPTransport == nil {
 			return nil, fmt.Errorf("custom MCP transport is required for 'custom' server type")
 		}
+		cache.logger.Info(ctx, "Initializing MCP server on demand", map[string]interface{}{
+			"server_name":           config.Name,
+			"server_type":           config.Type,
+			"custom_transport_type": config.CustomTransportType,
+		})
 		server, err = NewCustomTransportServer(ctx, CustomTransportServerConfig{
 			Transport:     config.CustomMCPTransport,
 			Logger:        serverLogger,
