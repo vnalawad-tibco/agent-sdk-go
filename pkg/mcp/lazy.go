@@ -114,6 +114,11 @@ func (cache *LazyMCPServerCache) getOrCreateServer(ctx context.Context, config L
 		if config.CustomMCPTransport == nil {
 			return nil, fmt.Errorf("custom MCP transport is required for 'custom' server type")
 		}
+
+		if config.CustomTransportType == "" {
+			return nil, fmt.Errorf("custom transport type is required for 'custom' server type")
+		}
+
 		cache.logger.Info(ctx, "Initializing MCP server on demand", map[string]interface{}{
 			"server_name":           config.Name,
 			"server_type":           config.Type,
